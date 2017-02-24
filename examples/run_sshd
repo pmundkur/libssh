@@ -1,0 +1,3 @@
+#!/bin/bash
+
+./sshd -d ./id_dsa -r ./id_rsa -p 4000 localhost

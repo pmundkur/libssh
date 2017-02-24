@@ -1,0 +1,1 @@
+cd build && cmake -DCMAKE_INSTALL_PREFIX=/home/mundkur/src/net/libssh/install  -DCMAKE_BUILD_TYPE=Debug -DWITH_GSSAPI=OFF .. && make && make install

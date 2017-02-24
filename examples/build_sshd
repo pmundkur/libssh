@@ -1,0 +1,4 @@
+#!/bin/bash
+
+gcc -o sshd -Wall -I../build -I../../install/include  sshd-cb.c -L../../install/lib -Wl,-rpath,../../install/lib -lssh
+
