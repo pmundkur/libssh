@@ -1,4 +1,5 @@
 #!/bin/bash
 
-gcc -o sshd -Wall -I../build -I../../install/include  sshd-cb.c -L../../install/lib -Wl,-rpath,../../install/lib -lssh
+gcc -o sshd -Wall -I../build -I../../install/include  sshd-cb.c -L../../install/lib -Wl,-rpath,../../install/lib -lssh -lutil
 
+gcc -o sshfd -Wall -I../build -I../../install/include  ssh_server_fork.c -L../../install/lib -Wl,-rpath,../../install/lib -lssh -lutil
