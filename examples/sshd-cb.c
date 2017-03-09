@@ -62,6 +62,13 @@ struct session_data_struct {
     int error;
 };
 
+struct bind_data_struct {
+    int accepted;
+    int errors;
+    /* temp place to recover connected session */
+    ssh_session session;
+};
+
 /* Incoming data from the client on the channel, going to input of
    local channel.
 */
@@ -349,6 +356,23 @@ static int env_request(ssh_session session, ssh_channel channel,
     return 0;
 }
 
+static void incoming_connection(ssh_bind sshbind, void *userdata) {
+    struct bind_data_struct *bdata = (struct bind_data_struct *)userdata;
+    ssh_session session = ssh_new();
+
+    int r = ssh_bind_accept(sshbind, session);
+    if (r == SSH_ERROR) {
+        fprintf(stdout, "%s: error accepting a connection : %s\n",
+                __func__, ssh_get_error(sshbind));
+        bdata->errors++;
+        ssh_free(session);
+        return;
+    }
+
+    bdata->session = session;
+    bdata->accepted++;
+}
+
 const char *argp_program_version = "libssh server example "
 SSH_STRINGIFY(LIBSSH_VERSION);
 const char *argp_program_bug_address = "<libssh@libssh.org>";
@@ -462,6 +486,12 @@ int serve_one(ssh_bind sshbind){
         .ws_ypixel = 0
     };
 
+    struct bind_data_struct bdata = {
+        .accepted = 0,
+        .errors   = 0,
+        .session  = NULL
+    };
+
     /* Our struct holding information about the channel. */
     struct channel_data_struct cdata = {
         .pid = 0,
@@ -512,7 +542,13 @@ int serve_one(ssh_bind sshbind){
         .channel_open_request_session_function = new_session_channel
     };
 
+    struct ssh_bind_callbacks_struct bind_cb = {
+        .incoming_connection = incoming_connection,
+    };
+
     int r, rc;
+
+    ssh_callbacks_init(&bind_cb);
 
     if(ssh_bind_listen(sshbind)<0){
         fprintf(stdout, "%s: error listening to socket: %s\n",
@@ -520,13 +556,50 @@ int serve_one(ssh_bind sshbind){
         return 1;
     }
 
-    session=ssh_new();
     printf("Waiting for session ...\n");
-    r=ssh_bind_accept(sshbind,session);
-    if(r==SSH_ERROR){
-        fprintf(stdout, "%s: error accepting a connection : %s\n",
-                __func__, ssh_get_error(sshbind));
-        return 1;
+    session=ssh_new();
+
+    if (0) {
+        r = ssh_bind_accept(sshbind,session);
+        if (r==SSH_ERROR) {
+            fprintf(stdout, "%s: error accepting a connection : %s\n",
+                    __func__, ssh_get_error(sshbind));
+            return 1;
+        }
+    } else {
+        /* non-blocking accept */
+
+        /* set-blocking before doing bind-accept */
+        ssh_bind_set_blocking(sshbind, 0);
+        ssh_bind_set_callbacks(sshbind, &bind_cb, &bdata);
+
+        mainloop = ssh_event_new();
+        r = ssh_bind_accept(sshbind, session);
+        if (r == SSH_ERROR) {
+            fprintf(stderr, "%s: error binding connection: %s / %s\n",
+                    __func__, ssh_get_error(sshbind), ssh_get_error(session));
+            return 1;
+        }
+        fprintf(stderr, "%s: starting loop\n", __func__);
+        do {
+            if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
+                fprintf(stderr, "%s: error waiting for connection\n", __func__);
+                ssh_event_free(mainloop);
+                return 1;
+            }
+        } while (bdata.accepted == 0 && bdata.errors == 0);
+
+        if (bdata.errors > 0) {
+            fprintf(stderr, "%s: error accepting connection\n", __func__);
+            ssh_event_free(mainloop);
+            return 1;
+        }
+        if (bdata.accepted) {
+            session = bdata.session;
+            bdata.session = NULL;
+        }
+        ssh_event_remove_session(mainloop, session);
+        ssh_event_free(mainloop);
     }
 
     ssh_callbacks_init(&server_cb);
