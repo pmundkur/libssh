@@ -124,6 +124,16 @@ static socket_t bind_socket(ssh_bind sshbind, const char *hostname,
         CLOSE_SOCKET(s);
         return -1;
     }
+    if (!sshbind->blocking) {
+        if (ssh_socket_set_nonblocking(s) != 0) {
+            ssh_set_error(sshbind,
+                          SSH_FATAL,
+                          "Setting socket non-blocking failed: %s",
+                          strerror(errno));
+            CLOSE_SOCKET(s);
+            return -1;
+	}
+    }
 
     freeaddrinfo (ai);
     return s;
