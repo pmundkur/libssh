@@ -1,6 +1,7 @@
 /* This is a sample implementation of a libssh based SSH server */
 /*
-Copyright 2003-2009 Aris Adamantiadis
+Copyright 2009 Aris Adamantiadis
+Copyright 2017 Prashanth Mundkur
 
 This file is part of the SSH Library
 
@@ -37,6 +38,8 @@ clients must be made or how a client should react.
 
 /* A userdata struct for channel. */
 struct channel_data_struct {
+    ssh_channel channel;
+    struct pid_registry *pids;
     /* pid of the child process the channel will spawn. */
     pid_t pid;
     /* For PTY allocation */
@@ -53,8 +56,20 @@ struct channel_data_struct {
     struct winsize *winsize;
 };
 
+struct channel_pid {
+    pid_t pid;
+    struct channel_data_struct *cdata;
+};
+
+#define MAX_PIDS 5
+struct pid_registry {
+    struct channel_pid pids[MAX_PIDS];
+};
+
 /* A userdata struct for session. */
 struct session_data_struct {
+    ssh_event mainloop;
+    struct pid_registry *pids;
     /* Pointer to the channel the session will allocate. */
     ssh_channel channel;
     int auth_attempts;
@@ -63,11 +78,30 @@ struct session_data_struct {
 };
 
 struct bind_data_struct {
+    ssh_event mainloop;
+    struct pid_registry *pids;
     int accepted;
     int errors;
-    /* temp place to recover connected session */
-    ssh_session session;
 };
+
+void init_pid_registry(struct pid_registry *pids) {
+    bzero(pids, sizeof(*pids));
+}
+
+void register_pid_for_channel(struct pid_registry *r, pid_t pid, struct channel_data_struct *cdata) {
+    int p = 0;
+    while (p < MAX_PIDS) {
+        if (r->pids[p].pid != 0) {
+            p++;
+            continue;
+        }
+        r->pids[p].pid = pid;
+        r->pids[p].cdata = cdata;
+        return;
+    }
+    fprintf(stderr, "%s: too many children (increase MAX_PIDS), exiting.\n", __func__);
+    exit(1);
+}
 
 /* Incoming data from the client on the channel, going to input of
    local channel.
@@ -76,10 +110,8 @@ static int data_function(ssh_session session, ssh_channel channel, void *data,
                          uint32_t len, int is_stderr, void *userdata) {
     struct channel_data_struct *cdata = (struct channel_data_struct *) userdata;
 
-    if (len == 0 /* || cdata->pid < 1 || kill(cdata->pid, 0) < 0 */) {
-        return 0;
-    }
-    fprintf(stdout, "%s: stdin <- len=%d\n", __func__, len);
+    if (len == 0) return 0;
+
     return write(cdata->child_stdin, (char *) data, len);
 }
 
@@ -87,9 +119,6 @@ static int pty_request(ssh_session session, ssh_channel channel,
                        const char *term, int cols, int rows, int py, int px,
                        void *userdata) {
     struct channel_data_struct *cdata = (struct channel_data_struct *)userdata;
-
-    fprintf(stdout, "%s(term=%s, cols=%d, rows=%d, px=%d, py=%d)\n",
-            __func__, term, cols, rows, px, py);
 
     cdata->winsize->ws_row = rows;
     cdata->winsize->ws_col = cols;
@@ -113,37 +142,71 @@ static int pty_resize(ssh_session session, ssh_channel channel, int cols,
     cdata->winsize->ws_xpixel = px;
     cdata->winsize->ws_ypixel = py;
 
-    fprintf(stdout, "%s(cols=%d, rows=%d, px=%d, py=%d)\n",
-            __func__, cols, rows, px, py);
-
-    if (cdata->pty_master != -1) {
+    if (cdata->pty_master != -1)
         return ioctl(cdata->pty_master, TIOCSWINSZ, cdata->winsize);
-    }
 
     return SSH_ERROR;
 }
 
+static int process_stdout(socket_t fd, int revents, void *userdata) {
+    char buf[BUF_SIZE];
+    int n = -1;
+    ssh_channel channel = (ssh_channel) userdata;
+
+    if (channel != NULL && (revents & POLLIN) != 0) {
+        n = read(fd, buf, BUF_SIZE);
+        if (n > 0)
+            ssh_channel_write(channel, buf, n);
+    }
+
+    return n;
+}
+
+static int process_stderr(socket_t fd, int revents, void *userdata) {
+    char buf[BUF_SIZE];
+    int n = -1;
+    ssh_channel channel = (ssh_channel) userdata;
+
+    if (channel != NULL && (revents & POLLIN) != 0) {
+        n = read(fd, buf, BUF_SIZE);
+        if (n > 0)
+            ssh_channel_write_stderr(channel, buf, n);
+    }
+
+    return n;
+}
+
 static int exec_pty(const char *mode, const char *command,
                     struct channel_data_struct *cdata) {
-    fprintf(stdout, "%s(mode=%s, command='%s')\n", __func__, mode, command);
 
     switch(cdata->pid = fork()) {
         case -1:
             close(cdata->pty_master);
             close(cdata->pty_slave);
+            cdata->pty_master = cdata->pty_slave = -1;
             fprintf(stderr, "Failed to fork\n");
             return SSH_ERROR;
         case 0:
             close(cdata->pty_master);
+            cdata->pty_master = -1;
             if (login_tty(cdata->pty_slave) != 0) {
+                fprintf(stderr, "error in login_tty: %s\n", strerror(errno));
                 exit(1);
             }
             execl("/bin/sh", "sh", mode, command, NULL);
             exit(0);
         default:
             close(cdata->pty_slave);
+            cdata->pty_slave = -1;
+            register_pid_for_channel(cdata->pids, cdata->pid, cdata);
             /* pty fd is bi-directional */
             cdata->child_stdout = cdata->child_stdin = cdata->pty_master;
+            if (ssh_event_add_fd(cdata->event, cdata->child_stdout, POLLIN,
+                                 process_stdout, cdata->channel) != SSH_OK) {
+                fprintf(stderr, "%s: failed to register stdout to poll context\n",
+                        __func__);
+                exit(1);
+            }
     }
     return SSH_OK;
 }
@@ -151,7 +214,6 @@ static int exec_pty(const char *mode, const char *command,
 static int exec_nopty(const char *command, struct channel_data_struct *cdata) {
     int in[2], out[2], err[2];
 
-    printf("%s(%s)\n", __func__, command);
     /* Do the plumbing to be able to talk with the child process. */
     if (pipe(in) != 0) {
         goto stdin_failed;
@@ -190,6 +252,20 @@ static int exec_nopty(const char *command, struct channel_data_struct *cdata) {
     cdata->child_stdout = out[0];
     cdata->child_stderr = err[0];
 
+    register_pid_for_channel(cdata->pids, cdata->pid, cdata);
+    if (ssh_event_add_fd(cdata->event, cdata->child_stdout, POLLIN,
+                         process_stdout, cdata->channel) != SSH_OK) {
+        fprintf(stderr, "%s: failed to register stdout to poll context\n",
+                __func__);
+        exit(1);
+    }
+    if (ssh_event_add_fd(cdata->event, cdata->child_stderr, POLLIN,
+                         process_stderr, cdata->channel) != SSH_OK) {
+        fprintf(stderr, "%s: failed to register stderr to poll context\n",
+                __func__);
+        exit(1);
+    }
+
     return SSH_OK;
 
 fork_failed:
@@ -209,14 +285,12 @@ static int exec_request(ssh_session session, ssh_channel channel,
                         const char *command, void *userdata) {
     struct channel_data_struct *cdata = (struct channel_data_struct *) userdata;
 
-    fprintf(stdout, "%s(%s)\n", __func__, command);
-    if(cdata->pid > 0) {
+    if(cdata->pid > 0)
         return SSH_ERROR;
-    }
 
-    if (cdata->pty_master != -1 && cdata->pty_slave != -1) {
+    if (cdata->pty_master != -1 && cdata->pty_slave != -1)
         return exec_pty("-c", command, cdata);
-    }
+
     return exec_nopty(command, cdata);
 }
 
@@ -224,15 +298,12 @@ static int shell_request(ssh_session session, ssh_channel channel,
                          void *userdata) {
     struct channel_data_struct *cdata = (struct channel_data_struct *) userdata;
 
-    printf("%s()\n", __func__);
-
-    if(cdata->pid > 0) {
+    if(cdata->pid > 0)
         return SSH_ERROR;
-    }
 
-    if (cdata->pty_master != -1 && cdata->pty_slave != -1) {
+    if (cdata->pty_master != -1 && cdata->pty_slave != -1)
         return exec_pty("-l", NULL, cdata);
-    }
+
     /* Client requested a shell without a pty, let's pretend we allow that */
     return SSH_OK;
 }
@@ -245,7 +316,6 @@ static int subsystem_request(ssh_session session, ssh_channel channel,
         return exec_request(session, channel, SFTP_SERVER_PATH, userdata);
     }
     */
-    fprintf(stdout, "%s(%s)\n", __func__, subsystem);
     return SSH_ERROR;
 }
 
@@ -253,17 +323,13 @@ static int auth_password(ssh_session session, const char *user,
                          const char *password, void *userdata) {
     struct session_data_struct *sdata = (struct session_data_struct *) userdata;
 
-    fprintf(stdout, "%s: authenticating user %s pwd %s\n",
-            __func__, user, password);
-
     if(strcmp(user,USER) == 0 && strcmp(password, PASSWORD) == 0){
         sdata->authenticated = 1;
-        fprintf(stdout, "%s: authenticated\n", __func__);
         return SSH_AUTH_SUCCESS;
     }
     if (sdata->auth_attempts >= 3){
-        fprintf(stdout, "%s: too many authentication tries (%d)\n",
-                __func__, sdata->auth_attempts);
+        fprintf(stdout, "%s: too many authentication tries (%d) for user %s, disconnecting.\n",
+                __func__, sdata->auth_attempts, user);
         ssh_disconnect(session);
         sdata->error = 1;
         return SSH_AUTH_DENIED;
@@ -272,105 +338,46 @@ static int auth_password(ssh_session session, const char *user,
     return SSH_AUTH_DENIED;
 }
 
-static ssh_channel new_session_channel(ssh_session session, void *userdata){
-    struct session_data_struct *sdata = (struct session_data_struct *) userdata;
-
-    if (sdata->channel)
-        fprintf(stderr, "%s: OVERWRITING PREVIOUS CHANNEL!\n", __func__);
-    fprintf(stdout, "%s: allocated session channel\n", __func__);
-
-    sdata->channel = ssh_channel_new(session);
-    return sdata->channel;
-}
-
-static int process_stdout(socket_t fd, int revents, void *userdata) {
-    char buf[BUF_SIZE];
-    int n = -1;
-    ssh_channel channel = (ssh_channel) userdata;
-
-    if (channel != NULL && (revents & POLLIN) != 0) {
-        n = read(fd, buf, BUF_SIZE);
-        fprintf(stdout, "%s: stdout -> %d bytes\n", __func__, n);
-        if (n > 0) {
-            ssh_channel_write(channel, buf, n);
-        }
-    }
-
-    return n;
-}
-
-static int process_stderr(socket_t fd, int revents, void *userdata) {
-    char buf[BUF_SIZE];
-    int n = -1;
-    ssh_channel channel = (ssh_channel) userdata;
-
-    if (channel != NULL && (revents & POLLIN) != 0) {
-        n = read(fd, buf, BUF_SIZE);
-        fprintf(stdout, "%s: stderr -> %d bytes\n", __func__, n);
-        if (n > 0) {
-            ssh_channel_write_stderr(channel, buf, n);
-        }
-    }
-
-    return n;
-}
 
 static int service_request(ssh_session session, const char *service,
                            void *userdata) {
-    fprintf(stdout, "%s(%s): accepting\n", __func__, service);
+    /* fprintf(stdout, "%s(%s): accepting\n", __func__, service); */
     return 0; // accepted; -1 => denied
 }
 
 static void signal_callback(ssh_session session, ssh_channel channel,
                             const char *signal, void *userdata) {
-    fprintf(stdout, "%s(%s)\n", __func__, signal);
+    /* fprintf(stdout, "%s(%s)\n", __func__, signal); */
 }
 
 static void close_callback(ssh_session session, ssh_channel channel,
                            void *userdata) {
-    fprintf(stdout, "%s()\n", __func__);
+    /* fprintf(stdout, "%s()\n", __func__); */
 }
 
 static void exit_status_callback(ssh_session session, ssh_channel channel,
                                  int exit_status, void *userdata) {
-    fprintf(stdout, "%s(%d)\n", __func__, exit_status);
+    /* fprintf(stdout, "%s(%d)\n", __func__, exit_status); */
 }
 
 static void exit_signal_callback(ssh_session session, ssh_channel channel,
                                  const char *signal, int core,
                                  const char *errmsg, const char *lang,
                                  void *userdata) {
-    fprintf(stdout, "%s(signal=%s core=%d errmsg=%s lang=%s)\n",
-            __func__, signal, core, errmsg, lang);
+    /* fprintf(stdout, "%s(signal=%s core=%d errmsg=%s lang=%s)\n",
+               __func__, signal, core, errmsg, lang); */
 }
 
 static void eof_function(ssh_session session, ssh_channel channel,
                   void *userdata) {
-    fprintf(stdout, "%s()\n", __func__);
+    /* fprintf(stdout, "%s()\n", __func__); */
 }
 
 static int env_request(ssh_session session, ssh_channel channel,
                  const char *env_name, const char *env_value,
                 void *userdata) {
-    fprintf(stdout, "%s: env[%s] <- %s\n", __func__, env_name, env_value);
+    /* fprintf(stdout, "%s: env[%s] <- %s\n", __func__, env_name, env_value); */
     return 0;
-}
-
-static void incoming_connection(ssh_bind sshbind, void *userdata) {
-    struct bind_data_struct *bdata = (struct bind_data_struct *)userdata;
-    ssh_session session = ssh_new();
-
-    int r = ssh_bind_accept(sshbind, session);
-    if (r == SSH_ERROR) {
-        fprintf(stdout, "%s: error accepting a connection : %s\n",
-                __func__, ssh_get_error(sshbind));
-        bdata->errors++;
-        ssh_free(session);
-        return;
-    }
-
-    bdata->session = session;
-    bdata->accepted++;
 }
 
 const char *argp_program_version = "libssh server example "
@@ -474,228 +481,206 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state) {
 /* Our argp parser. */
 static struct argp argp = {options, parse_opt, args_doc, doc, NULL, NULL, NULL};
 
-int serve_one(ssh_bind sshbind){
-    ssh_session session;
+/* Structure for storing the pty size. */
+struct winsize *new_winsize() {
+    struct winsize *wsize = (struct winsize *)calloc(1, sizeof(*wsize));
+    return wsize;
+}
+
+struct bind_data_struct *new_bind_data(ssh_event mainloop, struct pid_registry *pids) {
+    struct bind_data_struct *bdata = (struct bind_data_struct *)calloc(1, sizeof(*bdata));
+    bdata->mainloop = mainloop;
+    bdata->pids = pids;
+    return bdata;
+}
+
+/* Our struct holding information about the session. */
+struct session_data_struct *new_session_data(struct bind_data_struct *bdata) {
+    struct session_data_struct *sdata = (struct session_data_struct *)calloc(1, sizeof(*sdata));
+    sdata->mainloop = bdata->mainloop;
+    sdata->pids = bdata->pids;
+    return sdata;
+}
+
+/* Our struct holding information about the channel. */
+struct channel_data_struct *new_channel_data(struct session_data_struct *sdata, ssh_channel channel) {
+    struct channel_data_struct *cdata = (struct channel_data_struct *)calloc(1, sizeof(*cdata));
+    cdata->event = sdata->mainloop;
+    cdata->pids = sdata->pids;
+    cdata->channel = channel;
+    cdata->pid = 0;
+    cdata->pty_master = -1;
+    cdata->pty_slave = -1;
+    cdata->child_stdin = -1;
+    cdata->child_stdout = -1;
+    cdata->child_stderr = -1;
+    cdata->winsize = new_winsize();
+    return cdata;
+}
+
+void close_channel_data(struct channel_data_struct *cdata) {
+    if (cdata->pty_master != -1)   close(cdata->pty_master);
+    if (cdata->pty_slave != -1)    close(cdata->pty_slave);
+    if (cdata->child_stdin != -1)  close(cdata->child_stdin);
+
+    if (cdata->child_stdout != -1) {
+        if (cdata->event) ssh_event_remove_fd(cdata->event, cdata->child_stdout);
+        close(cdata->child_stdout);
+    }
+    if (cdata->child_stderr != -1) {
+        if (cdata->event) ssh_event_remove_fd(cdata->event, cdata->child_stderr);
+        close(cdata->child_stderr);
+    }
+    if (cdata->winsize) free(cdata->winsize);
+    cdata->winsize = NULL;
+}
+
+struct ssh_channel_callbacks_struct *new_channel_cb(struct channel_data_struct *cdata) {
+    struct ssh_channel_callbacks_struct *cb = (struct ssh_channel_callbacks_struct *)calloc(1, sizeof(*cb));
+
+    cb->userdata = cdata;
+
+    cb->channel_pty_request_function = pty_request;
+    cb->channel_pty_window_change_function = pty_resize;
+
+    cb->channel_shell_request_function = shell_request;
+    cb->channel_env_request_function = env_request;
+
+    cb->channel_exec_request_function = exec_request;
+
+    cb->channel_subsystem_request_function = subsystem_request;
+
+    cb->channel_data_function = data_function;
+    cb->channel_eof_function = eof_function;
+    cb->channel_close_function = close_callback;
+    cb->channel_write_wontblock_function = NULL;
+    cb->channel_signal_function = signal_callback;
+
+    cb->channel_exit_status_function = exit_status_callback;
+    cb->channel_exit_signal_function = exit_signal_callback;
+
+    ssh_callbacks_init(cb);
+    return cb;
+}
+
+static ssh_channel new_session_channel(ssh_session session, void *userdata){
+    struct session_data_struct *sdata = (struct session_data_struct *) userdata;
+
+    if (sdata->channel) {
+        fprintf(stderr, "%s: only one channel per session supported!\n", __func__);
+        return NULL;
+    }
+
+    sdata->channel = ssh_channel_new(session);
+    if (sdata->channel) {
+        struct channel_data_struct *cdata = new_channel_data(sdata, sdata->channel);
+        struct ssh_channel_callbacks_struct *cb = new_channel_cb(cdata);
+        if (cdata && cb)
+            ssh_set_channel_callbacks(sdata->channel, cb);
+    }
+    return sdata->channel;
+}
+
+struct ssh_server_callbacks_struct *new_server_cb(struct session_data_struct *sdata) {
+    struct ssh_server_callbacks_struct *cb = (struct ssh_server_callbacks_struct *)calloc(1, sizeof(*cb));
+
+    cb->userdata = sdata;
+
+    cb->auth_password_function = auth_password;
+    cb->service_request_function = service_request;
+    cb->channel_open_request_session_function = new_session_channel;
+
+    ssh_callbacks_init(cb);
+    return cb;
+}
+
+static void incoming_connection(ssh_bind sshbind, void *userdata) {
+    struct session_data_struct *sdata;
+    struct ssh_server_callbacks_struct *server_cb;
+
+    struct bind_data_struct *bdata = (struct bind_data_struct *)userdata;
+    ssh_session session = ssh_new();
+
+    int r = ssh_bind_accept(sshbind, session);
+    if (r == SSH_ERROR) {
+        fprintf(stderr, "%s: error accepting a connection : %s\n",
+                __func__, ssh_get_error(sshbind));
+        bdata->errors++;
+        ssh_free(session);
+        return;
+    }
+
+    if (ssh_handle_key_exchange(session)) {
+        fprintf(stderr, "%s: ssh_handle_key_exchange: %s\n",
+                __func__, ssh_get_error(session));
+        ssh_free(session);
+        return;
+    }
+    ssh_set_auth_methods(session,SSH_AUTH_METHOD_PASSWORD);
+
+    ssh_event_add_session(bdata->mainloop, session);
+
+    sdata = new_session_data(bdata);
+    server_cb = new_server_cb(sdata);
+    ssh_set_server_callbacks(session, server_cb);
+    bdata->accepted++;
+}
+
+
+int serve(ssh_bind sshbind){
     ssh_event mainloop;
-
-    /* Structure for storing the pty size. */
-    struct winsize wsize = {
-        .ws_row = 0,
-        .ws_col = 0,
-        .ws_xpixel = 0,
-        .ws_ypixel = 0
-    };
-
-    struct bind_data_struct bdata = {
-        .accepted = 0,
-        .errors   = 0,
-        .session  = NULL
-    };
-
-    /* Our struct holding information about the channel. */
-    struct channel_data_struct cdata = {
-        .pid = 0,
-        .pty_master = -1,
-        .pty_slave = -1,
-        .child_stdin = -1,
-        .child_stdout = -1,
-        .child_stderr = -1,
-        .event = NULL,
-        .winsize = &wsize
-    };
-
-    /* Our struct holding information about the session. */
-    struct session_data_struct sdata = {
-        .channel = NULL,
-        .auth_attempts = 0,
-        .authenticated = 0,
-        .error = 0
-    };
-
-    struct ssh_channel_callbacks_struct channel_cb = {
-        .userdata = &cdata,
-
-        .channel_pty_request_function = pty_request,
-        .channel_pty_window_change_function = pty_resize,
-
-        .channel_shell_request_function = shell_request,
-        .channel_env_request_function = env_request,
-
-        .channel_exec_request_function = exec_request,
-
-        .channel_subsystem_request_function = subsystem_request,
-
-        .channel_data_function = data_function,
-        .channel_eof_function = eof_function,
-        .channel_close_function = close_callback,
-        .channel_write_wontblock_function = NULL,
-        .channel_signal_function = signal_callback,
-
-        .channel_exit_status_function = exit_status_callback,
-        .channel_exit_signal_function = exit_signal_callback,
-    };
-
-    struct ssh_server_callbacks_struct server_cb = {
-        .userdata = &sdata,
-        .auth_password_function = auth_password,
-        .service_request_function = service_request,
-        .channel_open_request_session_function = new_session_channel
-    };
+    struct pid_registry reg;
 
     struct ssh_bind_callbacks_struct bind_cb = {
         .incoming_connection = incoming_connection,
     };
 
+    struct bind_data_struct *bdata;
+
     int r, rc;
 
-    ssh_callbacks_init(&bind_cb);
+    init_pid_registry(&reg);
 
     if(ssh_bind_listen(sshbind)<0){
-        fprintf(stdout, "%s: error listening to socket: %s\n",
+        fprintf(stderr, "%s: error listening to socket: %s\n",
                 __func__, ssh_get_error(sshbind));
         return 1;
     }
 
-    printf("Waiting for session ...\n");
-    session=ssh_new();
+    ssh_bind_set_blocking(sshbind, 0);
+    ssh_callbacks_init(&bind_cb);
+    mainloop = ssh_event_new();
 
-    if (0) {
-        r = ssh_bind_accept(sshbind,session);
-        if (r==SSH_ERROR) {
-            fprintf(stdout, "%s: error accepting a connection : %s\n",
-                    __func__, ssh_get_error(sshbind));
-            return 1;
-        }
-    } else {
-        /* non-blocking accept */
+    bdata = new_bind_data(mainloop, &reg);
+    ssh_bind_set_callbacks(sshbind, &bind_cb, bdata);
 
-        /* set-blocking before doing bind-accept */
-        ssh_bind_set_blocking(sshbind, 0);
-        ssh_bind_set_callbacks(sshbind, &bind_cb, &bdata);
+    r = ssh_bind_accept_nonblocking(sshbind, mainloop);
+    if (r == SSH_ERROR) {
+        fprintf(stderr, "%s: error binding connection: %s\n",
+                __func__, ssh_get_error(sshbind));
+        return 1;
+    }
 
-        mainloop = ssh_event_new();
-        r = ssh_bind_accept(sshbind, session);
-        if (r == SSH_ERROR) {
-            fprintf(stderr, "%s: error binding connection: %s / %s\n",
-                    __func__, ssh_get_error(sshbind), ssh_get_error(session));
-            return 1;
-        }
-        fprintf(stderr, "%s: starting loop\n", __func__);
-        do {
-            if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
-                fprintf(stderr, "%s: error waiting for connection\n", __func__);
-                ssh_event_free(mainloop);
-                return 1;
-            }
-        } while (bdata.accepted == 0 && bdata.errors == 0);
-
-        if (bdata.errors > 0) {
-            fprintf(stderr, "%s: error accepting connection\n", __func__);
+    do {
+        int p;
+        if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
+            fprintf(stderr, "%s: error handling connections\n", __func__);
             ssh_event_free(mainloop);
             return 1;
         }
-        if (bdata.accepted) {
-            session = bdata.session;
-            bdata.session = NULL;
-        }
-        ssh_event_remove_session(mainloop, session);
-        ssh_event_free(mainloop);
-    }
-
-    ssh_callbacks_init(&server_cb);
-    ssh_callbacks_init(&channel_cb);
-
-    ssh_set_server_callbacks(session, &server_cb);
-
-    fprintf(stdout, "%s: starting key exchange ...\n", __func__);
-    if (ssh_handle_key_exchange(session)) {
-        fprintf(stdout, "%s: ssh_handle_key_exchange: %s\n",
-                __func__, ssh_get_error(session));
-        return 1;
-    }
-    ssh_set_auth_methods(session,SSH_AUTH_METHOD_PASSWORD);
-
-    fprintf(stdout, "%s: starting main loop\n", __func__);
-    mainloop = ssh_event_new();
-    ssh_event_add_session(mainloop, session);
-
-    while (!(sdata.authenticated && sdata.channel != NULL)){
-        if(sdata.error)
-            break;
-        r = ssh_event_dopoll(mainloop, -1);
-        if (r==SSH_ERROR) {
-            fprintf(stdout, "%s: error : %s\n",
-                    __func__, ssh_get_error(session));
-            ssh_disconnect(session);
-            ssh_event_remove_session(mainloop, session);
-            return 1;
-        }
-    }
-    if(sdata.error){
-        fprintf(stdout, "%s: error, exiting loop\n", __func__);
-        return 1;
-    }
-
-    fprintf(stdout, "%s: authenticated and got a channel\n", __func__);
-    ssh_set_channel_callbacks(sdata.channel, &channel_cb);
-
-    do {
-        /* Poll the main event which takes care of the session, the channel and
-         * even our child process's stdout/stderr (once it's started). */
-        if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
-            fprintf(stderr, "%s: poll error, closing channel\n", __func__);
-            ssh_channel_close(sdata.channel);
-        }
-
-        /* If child process's stdout/stderr has been registered with the event,
-         * or the child process hasn't started yet, continue. */
-        if (cdata.event != NULL || cdata.pid == 0) {
-            continue;
-        }
-        /* Executed only once, once the child process starts. */
-        cdata.event = mainloop;
-        /* If stdout valid, add stdout to be monitored by the poll event. */
-        if (cdata.child_stdout != -1) {
-            if (ssh_event_add_fd(mainloop, cdata.child_stdout, POLLIN,
-                                 process_stdout, sdata.channel) != SSH_OK) {
-                fprintf(stderr, "%s: failed to register stdout to poll context\n",
-                        __func__);
-                ssh_channel_close(sdata.channel);
+        for (p = 0; p < MAX_PIDS; p++) {
+            if (reg.pids[p].pid == 0) continue;
+            if (waitpid(reg.pids[p].pid, &rc, WNOHANG) != 0) {
+                ssh_channel channel = reg.pids[p].cdata->channel;
+                ssh_channel_close(channel);
+                ssh_disconnect(ssh_channel_get_session(channel));
+                close_channel_data(reg.pids[p].cdata);
+                free(reg.pids[p].cdata);
+                reg.pids[p].cdata = NULL;
+                reg.pids[p].pid = 0;
             }
         }
-
-        /* If stderr valid, add stderr to be monitored by the poll event. */
-        if (cdata.child_stderr != -1){
-            if (ssh_event_add_fd(mainloop, cdata.child_stderr, POLLIN,
-                                 process_stderr, sdata.channel) != SSH_OK) {
-                fprintf(stderr, "%s: failed to register stderr to poll context\n",
-                        __func__);
-                ssh_channel_close(sdata.channel);
-            }
-        }
-    } while (ssh_channel_is_open(sdata.channel)
-             && ((cdata.pid == 0) || waitpid(cdata.pid, &rc, WNOHANG) == 0));
-
-    if (!ssh_channel_is_open(sdata.channel)) {
-        fprintf(stderr, "%s: channel is not open, quitting loop.\n", __func__);
-    }
-    if (waitpid(cdata.pid, &rc, WNOHANG) != 0) {
-        fprintf(stderr, "%s: child exited with code %d.\n", __func__, rc);
-    }
-
-    if (!close(cdata.pty_master))   fprintf(stderr, "%s: error closing pty_master\n", __func__);
-    if (!close(cdata.child_stdin))  fprintf(stderr, "%s: error closing child stdin\n", __func__);
-    if (!close(cdata.child_stdout)) fprintf(stderr, "%s: error closing child stdout\n", __func__);
-    if (!close(cdata.child_stderr)) fprintf(stderr, "%s: error closing child stderr\n", __func__);
-
-    /* Remove the descriptors from the polling context, since they are now
-     * closed, they will always trigger during the poll calls. */
-    ssh_event_remove_fd(mainloop, cdata.child_stdout);
-    ssh_event_remove_fd(mainloop, cdata.child_stderr);
-
-    ssh_disconnect(session);
-    ssh_free(session);
-    ssh_event_free(mainloop);
+    } while (bdata->errors == 0);
 
     return 0;
 }
@@ -715,10 +700,9 @@ int main(int argc, char **argv){
      * Parse our arguments; every option seen by parse_opt will
      * be reflected in arguments.
      */
-    printf("Parsing args ...\n");
     argp_parse (&argp, argc, argv, 0, 0, sshbind);
 
-    serve_one(sshbind);
+    serve(sshbind);
 
     ssh_bind_free(sshbind);
     ssh_finalize();
