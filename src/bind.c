@@ -511,6 +511,10 @@ int ssh_bind_accept(ssh_bind sshbind, ssh_session session) {
   return rc;
 }
 
+int ssh_bind_accept_nonblocking(ssh_bind sshbind, ssh_event event) {
+  ssh_poll_handle h = ssh_bind_get_poll(sshbind);
+  return ssh_event_add_poll(event, h);
+}
 
 /**
  * @}
