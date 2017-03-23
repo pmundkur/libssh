@@ -161,16 +161,6 @@ LIBSSH_API void ssh_bind_fd_toaccept(ssh_bind ssh_bind_o);
 LIBSSH_API int ssh_bind_accept(ssh_bind ssh_bind_o, ssh_session session);
 
 /**
- * @brief Register for non-blocking accepts of incoming ssh connections
- *
- * @param  ssh_bind_o     The ssh server bind to accept a connection.
- * @param  event			A non-blocking event mainloop
- * @see ssh_bind_accept
- * @return SSH_OK when successfully registered
- */
-LIBSSH_API int ssh_bind_accept_nonblocking(ssh_bind ssh_bind_o, ssh_event event);
-
-/**
  * @brief Accept an incoming ssh connection on the given file descriptor
  *        and initialize the session.
  *
@@ -195,6 +185,26 @@ LIBSSH_API ssh_gssapi_creds ssh_gssapi_get_creds(ssh_session session);
  * @return SSH_OK if the key exchange was successful
  */
 LIBSSH_API int ssh_handle_key_exchange(ssh_session session);
+
+/**
+ * @brief Register for non-blocking accepts of incoming ssh connections
+ *
+ * @param  ssh_bind_o     The ssh server bind to accept a connection.
+ * @param  event			A non-blocking event mainloop
+ * @see ssh_bind_accept
+ * @return SSH_OK when successfully registered
+ */
+LIBSSH_API int ssh_event_add_bind(ssh_event event, ssh_bind ssh_bind_o);
+
+/**
+ * @brief Remove bind from the event
+ *
+ * @param  ssh_bind_o     The ssh server bind to accept a connection.
+ * @param  event			A non-blocking event mainloop
+ * @see ssh_bind_accept
+ * @return SSH_OK when successfully registered
+ */
+LIBSSH_API int ssh_event_remove_bind(ssh_event event, ssh_bind ssh_bind_o);
 
 /**
  * @brief Free a ssh servers bind.

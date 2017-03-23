@@ -654,7 +654,7 @@ int serve(ssh_bind sshbind){
     bdata = new_bind_data(mainloop, &reg);
     ssh_bind_set_callbacks(sshbind, &bind_cb, bdata);
 
-    r = ssh_bind_accept_nonblocking(sshbind, mainloop);
+    r = ssh_event_add_bind(mainloop, sshbind);
     if (r == SSH_ERROR) {
         fprintf(stderr, "%s: error binding connection: %s\n",
                 __func__, ssh_get_error(sshbind));
@@ -665,6 +665,7 @@ int serve(ssh_bind sshbind){
         int p;
         if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
             fprintf(stderr, "%s: error handling connections\n", __func__);
+            ssh_event_remove_bind(mainloop, sshbind);
             ssh_event_free(mainloop);
             return 1;
         }

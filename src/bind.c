@@ -511,9 +511,17 @@ int ssh_bind_accept(ssh_bind sshbind, ssh_session session) {
   return rc;
 }
 
-int ssh_bind_accept_nonblocking(ssh_bind sshbind, ssh_event event) {
+int ssh_event_add_bind(ssh_event event, ssh_bind sshbind) {
   ssh_poll_handle h = ssh_bind_get_poll(sshbind);
+  if (!h) return SSH_ERROR;
   return ssh_event_add_poll(event, h);
+}
+
+int ssh_event_remove_bind(ssh_event event, ssh_bind sshbind) {
+  ssh_poll_handle h = ssh_bind_get_poll(sshbind);
+  if (!h) return SSH_ERROR;
+  ssh_event_remove_poll(event, h);
+  return SSH_OK;
 }
 
 /**
